@@ -40,6 +40,14 @@ class MemRecTrainer:
             config: Configuration dictionary
             device: Device (for API consistency)
         """
+        if getattr(dataset, "frozen_protocol", False) and config.get("load_memory_path"):
+            raise ValueError("Legacy memory imports are disabled: rebuild from TRAIN with title/category")
+        if getattr(dataset, "frozen_protocol", False):
+            m = config.get('memrec', {})
+            if m.get('reranker_mode') != 'llm' or m.get('reranker_output') != 'list':
+                raise ValueError('Frozen MemRec requires llm reranker and C-label list output')
+            if config.get('item_text_mode', 'category') != 'category':
+                raise ValueError('Descriptions are forbidden in frozen MemRec')
         self.dataset = dataset
         self.config = config
         self.device = device
@@ -119,7 +127,9 @@ class MemRecTrainer:
         self.fanout_cap = write_config.get('fanout_cap', 8)
         
         # eval_feedback mode
-        self.eval_feedback = config.get('eval_feedback', 'none')  # gt, random, none
+        if config.get('eval_feedback', 'none') != 'none':
+            raise ValueError('Evaluation feedback is forbidden; use eval_feedback: none')
+        self.eval_feedback = 'none'  # gt, random, none
         
         # Warm-up configuration (v2 new)
         warmup_config = config.get('warmup', {})
@@ -185,7 +195,7 @@ class MemRecTrainer:
         
         # Load item metadata
         print("\nLoading item metadata for MemRec...")
-        self.dataset.load_item_metadata(item_text_mode=config.get('item_text_mode', 'description'))
+        self.dataset.load_item_metadata(item_text_mode='category')
         
         # Initialize MemRec Agent (v2: three stages)
         print("\nInitializing MemRec Agent v2...")
@@ -495,6 +505,12 @@ class MemRecTrainer:
         Returns:
             Metrics dictionary
         """
+        if getattr(self.dataset, 'frozen_protocol', False):
+            if split != 'test' or parallel:
+                raise ValueError('Frozen protocol supports sequential test evaluation only')
+            if save_dir:
+                self.save_dir = save_dir
+            return self._test_frozen()
         # Initialize debug logger (disabled in parallel mode)
         if self.debug and save_dir and not parallel:
             self._init_debug_logger(save_dir)
@@ -1254,6 +1270,9 @@ class MemRecTrainer:
         print("Testing MemRec on test set")
         print("="*80)
         
+        if getattr(self.dataset, "frozen_protocol", False):
+            return self._test_frozen()
+
         # Evaluation
         save_dir = getattr(self, 'save_dir', None)
         test_metrics = self.evaluate(split='test', save_dir=save_dir, parallel=parallel, n_workers=n_workers)
@@ -1280,3 +1299,116 @@ class MemRecTrainer:
                         print(f"LLM conversations saved to {conversation_path}")
         
         return test_metrics
+
+    def _test_frozen(self):
+        """Train-only memory construction followed by strictly read-only evaluation.
+
+        Sequential by design: Stage-W is stateful and ordering must be reproducible.
+        This path does not use legacy warm-up, random eval sampling or eval feedback.
+        """
+        import hashlib
+        import math
+        from src.memory.graph import UserItemGraph
+        ds = self.dataset
+        save_dir = Path(getattr(self, 'save_dir', None) or self.config.get('output_dir', 'results/memrec_frozen'))
+        save_dir.mkdir(parents=True, exist_ok=True)
+        if self.reranker_mode != 'llm' or self.reranker_output != 'list':
+            raise ValueError('Frozen protocol requires reranker_mode=llm and reranker_output=list (C-label)')
+        if getattr(self, '_frozen_completed', False):
+            raise RuntimeError('Create a new trainer for a new frozen evaluation')
+        self._frozen_completed = True
+        original_train = ds.train_data
+        warmup_records = []
+        # Each round reveals one further TRAIN interaction. All train-user histories
+        # are clipped to that round before graph construction, including neighbors.
+        try:
+            if self.warmup_enabled and self.enable_stage_w:
+                rounds = max(0, int(self.warmup_rounds))
+                for round_idx in range(rounds):
+                    offset = rounds-round_idx
+                    prefixes, targets = {}, {}
+                    for u in ds.train_user_ids:
+                        full = ds.full_train_data[u]
+                        cut = len(full)-offset
+                        prefixes[u] = full[:max(0, cut)][-ds.history_size:]
+                        if cut >= 1:
+                            targets[u] = full[cut]
+                    ds.train_data = prefixes
+                    self.agent.graph = UserItemGraph(ds)
+                    for u in tqdm(ds.train_user_ids, desc=f'TRAIN memory {round_idx+1}/{rounds}', unit='user'):
+                        if u not in targets:
+                            continue
+                        target = targets[u]
+                        pool = [i for i in ds.training_negatives[u]
+                                if i not in set(ds.full_train_data[u]) and i != target]
+                        count = int(self.config.get('warmup', {}).get('n_candidates', self.n_eval_candidates))
+                        if count < 2 or len(pool) < count-1:
+                            raise ValueError(f'Train user={ds.raw_user_ids[u]}: insufficient declared negatives for {count} candidates')
+                        rng = random.Random(f'{ds.seed}:{ds.raw_user_ids[u]}:{round_idx}')
+                        candidates = [target] + rng.sample(pool, count-1)
+                        rng.shuffle(candidates)
+                        ranked, details = self.agent.rerank(
+                            u, candidates, instruction=ds.history_text(u), return_details=True)
+                        if len(ranked) != len(candidates) or set(ranked) != set(candidates):
+                            raise ValueError('Warm-up ranking is not a candidate permutation')
+                        # Preserve original MemRec warm-up trigger: target in top 10.
+                        wrote = ranked.index(target) < 10
+                        if wrote:
+                            self.agent.write(u, {'action': 'CLICK', 'item_id': target,
+                                                 'position': ranked.index(target)},
+                                             details.get('facets', []),
+                                             pruned_subgraph=details.get('pruned_subgraph'))
+                        warmup_records.append({'user_id': ds.raw_user_ids[u], 'round': round_idx+1,
+                                               'target': ds.raw_item_ids[target], 'stage_w': wrote})
+        finally:
+            ds.train_data = original_train
+            self.agent.graph = UserItemGraph(ds)
+        self.agent.evaluation_only = True
+        self.agent.storage.read_only = True
+        def snapshot():
+            storage = self.agent.storage
+            payload = {'users': storage.user_profiles, 'items': storage.item_descriptions,
+                       'updates': storage.n_updates}
+            return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        before = snapshot()
+        calls_before = self.agent.n_stage_w_calls
+        positions = []
+        mapping = {'user_id_map': ds.user_id_map, 'item_id_map': ds.item_id_map}
+        (save_dir/'id_maps.json').write_text(json.dumps(mapping, ensure_ascii=False, indent=2))
+        (save_dir/'warmup.json').write_text(json.dumps(warmup_records, ensure_ascii=False, indent=2))
+        with (save_dir/'rankings.jsonl').open('w', encoding='utf-8') as output:
+            for u in tqdm(ds.eval_user_ids, desc='MemRec frozen eval', unit='user'):
+                candidates = list(ds.frozen_candidates[u])
+                ranked, details = self.agent.rerank(
+                    u, candidates, instruction=ds.history_text(u), return_details=True)
+                if len(ranked) != len(candidates) or set(ranked) != set(candidates):
+                    raise ValueError('Evaluation ranking is not a candidate permutation')
+                target = ds.test_data[u]  # Used only after ranking for metrics/output.
+                positions.append(ranked.index(target))
+                output.write(json.dumps({'user_id': ds.raw_user_ids[u],
+                    'candidate_item_ids': [ds.raw_item_ids[i] for i in candidates],
+                    'ranked_item_ids': [ds.raw_item_ids[i] for i in ranked],
+                    'target': ds.raw_item_ids[target],
+                    'diagnostics': getattr(self.agent.reranker, 'last_diagnostics', {})},
+                    ensure_ascii=False)+'\n')
+                output.flush()
+        after = snapshot()
+        if before != after or calls_before != self.agent.n_stage_w_calls:
+            raise RuntimeError('Memory changed during evaluation')
+        metrics = {}
+        for k in self.topk:
+            metrics[f'Hit@{k}'] = sum(p < k for p in positions)/len(positions)
+            metrics[f'Recall@{k}'] = metrics[f'Hit@{k}']
+            metrics[f'NDCG@{k}'] = sum(1/math.log2(p+2) if p < k else 0 for p in positions)/len(positions)
+        metrics.update(n_eval_users=len(positions), n_stage_w_calls=0,
+                       warmup_stage_w_calls=calls_before, memory_unchanged=True,
+                       memory_sha256=after, train_eval_overlap=ds.overlap_count)
+        (save_dir/'metrics.json').write_text(json.dumps(metrics, indent=2), encoding='utf-8')
+        # Complete snapshot; intentionally not accepted as legacy warm-start input.
+        (save_dir/'memory_frozen.json').write_text(json.dumps({
+            'schema': 'memrec_frozen_title_category_train_only_v1',
+            'user_profiles': self.agent.storage.user_profiles,
+            'item_memories': self.agent.storage.item_descriptions,
+            'memory_sha256': after}, ensure_ascii=False), encoding='utf-8')
+        print(json.dumps(metrics, indent=2))
+        return metrics

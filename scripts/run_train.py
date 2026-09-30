@@ -294,6 +294,14 @@ def main():
              "candidate), or 'none' (candidate-independent retrieval) (overrides config.memrec.stage_r_candidates)"
     )
 
+    # MemRec-only frozen JSON protocol options.
+    parser.add_argument('--train_users_file')
+    parser.add_argument('--eval_users_file')
+    parser.add_argument('--candidate_file')
+    parser.add_argument('--num_train_users', type=int)
+    parser.add_argument('--num_test_users', type=int)
+    parser.add_argument('--history_size', type=int)
+    parser.add_argument('--allow_overlap', action='store_true', default=None)
     args = parser.parse_args()
 
     # Load configuration
@@ -302,6 +310,11 @@ def main():
     print("=" * 80)
     print(f"\nLoading config from: {args.config}")
     config = load_config(args.config)
+    for key in ('train_users_file', 'eval_users_file', 'candidate_file',
+                'num_train_users', 'num_test_users', 'history_size', 'allow_overlap'):
+        if getattr(args, key) is not None:
+            config[key] = getattr(args, key)
+
     
     # Ensure seed exists for downstream logging
     if 'seed' not in config:
@@ -392,22 +405,19 @@ def main():
     device = get_device(args.device)
     print(f"Using device: {device}")
     
-    # Load dataset
-    if args.data_dir is None:
-        data_dir = PROJECT_ROOT / "data" / "processed" / args.dataset
+    # Keep the old dataset loader available to existing callers.
+    if config.get('data_format') == 'frozen_json':
+        from src.data.dataset_frozen import FrozenRecDataset
+        data_dir = Path(args.data_dir) if args.data_dir else PROJECT_ROOT / 'data' / args.dataset
+        dataset = FrozenRecDataset(data_dir, config)
+        if args.eval_user_list or args.n_eval_users is not None:
+            raise ValueError('Use --eval_users_file and --num_test_users for frozen JSON')
+        if args.parallel:
+            raise ValueError('Frozen MemRec currently runs sequentially; parallel workers are not GPU batching')
     else:
-        data_dir = Path(args.data_dir)
-    
-    data_file = data_dir / f"{args.dataset}.inter"
-    
-    if not data_file.exists():
-        print(f"\nError: Data file not found: {data_file}")
-        print("Please prepare the data first or download from Google Drive.")
-        print("See README.md for instructions.")
-        sys.exit(1)
-    
-    print(f"\nLoading dataset from: {data_file}")
-    dataset = RecDataset(str(data_file), seed=seed)
+        data_dir = Path(args.data_dir) if args.data_dir else PROJECT_ROOT / 'data' / 'processed' / args.dataset
+        data_file = data_dir / f'{args.dataset}.inter'
+        dataset = RecDataset(str(data_file), seed=seed)
     print(dataset)
     
     stats = dataset.get_stats()

@@ -17,6 +17,7 @@ class MemoryStorage:
         user_profiles: {user_id: str}  # User profiles (natural language)
         item_descriptions: {item_id: str}  # Item descriptions (natural language)
         """
+        self.read_only = False
         self.user_profiles = {}  # {user_id: "A book enthusiast interested in..."}
         self.item_descriptions = {}  # {item_id: "A children's book about..."}
         self.n_updates = 0  # Count of updates
@@ -31,12 +32,16 @@ class MemoryStorage:
     
     def update_user_memory(self, user_id: int, new_profile: str):
         """Update user memory (complete overwrite)"""
+        if self.read_only:
+            raise RuntimeError("Memory is frozen during evaluation")
         if new_profile and new_profile.strip():
             self.user_profiles[user_id] = new_profile.strip()
             self.n_updates += 1
     
     def update_item_memory(self, item_id: int, new_description: str):
         """Update item memory (complete overwrite)"""
+        if self.read_only:
+            raise RuntimeError("Memory is frozen during evaluation")
         if new_description and new_description.strip():
             self.item_descriptions[item_id] = new_description.strip()
             self.n_updates += 1
@@ -48,13 +53,15 @@ class MemoryStorage:
         Args:
             item_metadata: {item_id: {'title': ..., 'description': ...}}
         """
+        if self.read_only:
+            raise RuntimeError("Memory is frozen during evaluation")
         print("Initializing item descriptions from metadata...")
         for item_id, meta in item_metadata.items():
             if item_id in self.item_descriptions:
                 continue  # Already has description, skip
             
             title = meta.get('title', f'Item-{item_id}')
-            desc = meta.get('description', '')
+            desc = meta.get('category', '')
             
             # Construct initial description (handle list or string format)
             if desc:
@@ -124,6 +131,8 @@ class MemoryStorage:
     
     def load(self, load_path: str):
         """Load from file"""
+        if self.read_only:
+            raise RuntimeError('Memory is frozen during evaluation')
         with open(load_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
@@ -143,6 +152,8 @@ class MemoryStorage:
         skips ids already present, so loaded item memories are preserved.
         """
         n_users, n_items = 0, 0
+        if self.read_only:
+            raise RuntimeError('Memory is frozen during evaluation')
         with open(load_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()

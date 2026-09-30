@@ -39,7 +39,8 @@ class UserItemGraph:
             for pos, item_id in enumerate(item_list):
                 # Record user-item edge
                 self.items_by_user[user_id].append(item_id)
-                self.users_by_item[item_id].append(user_id)
+                if user_id in getattr(self.dataset, "graph_train_users", self.dataset.train_data):
+                    self.users_by_item[item_id].append(user_id)
                 
                 # Compute recency: newer items have higher scores (0 to 1)
                 # pos=0 is earliest, pos=n_items-1 is most recent

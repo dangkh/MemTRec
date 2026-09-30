@@ -79,7 +79,7 @@ Return ONLY valid JSON:
             for c in candidates:
                 cid = c['id']
                 title = c.get('title', f'Item {cid}')
-                description = c.get('description', '')
+                description = c.get('category', '')
                 tags = c.get('tags', [])
                 if description:
                     # Truncate long descriptions
@@ -249,6 +249,9 @@ Your response should be a JSON object with a single field:
         Returns:
             [{'item_id': int, 'score': float, 'rationale': str}, ...]
         """
+        if self.output_mode == "list":
+            return self._rerank_clabel(user_id, retrieval_bundle, candidates, item_mems,
+                                       instruction, temperature, max_tokens, debug_logger, vanilla_mode)
         # Build prompt
         messages = self.build_rerank_prompt(
             user_id=user_id,
@@ -298,3 +301,49 @@ Your response should be a JSON object with a single field:
             # Return default scores
             return [{'item_id': c['id'], 'score': 0.5, 'rationale': 'Error'} for c in candidates]
 
+
+    def _rerank_clabel(self, user_id, retrieval_bundle, candidates, item_mems,
+                       instruction, temperature, max_tokens, debug_logger, vanilla_mode):
+        labels = {f"C{i:02d}": c['id'] for i, c in enumerate(candidates, 1)}
+        rows = [{"label": label, "title": c.get("title", ""),
+                 "category": c.get("category", ""),
+                 "memory": "" if vanilla_mode else (item_mems or {}).get(c['id'], "")}
+                for label, c in zip(labels, candidates)]
+        prompt = (
+            "Rank ALL candidates for the user's next interaction, most relevant first. "
+            "Use only candidate labels C01..Cn, each exactly once. Never output item IDs.\n"
+            "Observed TRAIN history (oldest to newest):\n" + (instruction or "") +
+            "\nRetrieved preferences:\n" + json.dumps(
+                [] if vanilla_mode else retrieval_bundle.get("facets", []), ensure_ascii=False) +
+            "\nCandidates:\n" + json.dumps(rows, ensure_ascii=False) +
+            '\nReturn only JSON: {"ranking": ["C01", "C02"], "reasoning": "One sentence."}'
+            " The example labels are illustrative; return every supplied candidate label."
+        )
+        error = None
+        try:
+            response = self.llm.generate_json(
+                messages=[{"role": "user", "content": prompt}],
+                properties={"ranking": {"type": "array", "items": {"type": "string"}},
+                            "reasoning": {"type": "string"}},
+                temperature=temperature, max_tokens=max_tokens, debug_logger=debug_logger)
+            raw = response.get("ranking", [])
+            if not isinstance(raw, list):
+                raise ValueError("ranking must be a list")
+            reasoning = str(response.get("reasoning", ""))
+        except Exception as exc:
+            raw, reasoning, error = [], "", str(exc)
+        ranked, seen, unknown, duplicate = [], set(), [], []
+        for label in raw:
+            if not isinstance(label, str) or label not in labels:
+                unknown.append(label)
+            elif label in seen:
+                duplicate.append(label)
+            else:
+                seen.add(label)
+                ranked.append(label)
+        missing = [label for label in labels if label not in seen]
+        self.last_diagnostics = {"raw_labels": raw, "missing": missing, "unknown": unknown,
+                                 "duplicates": duplicate, "error": error, "reasoning": reasoning}
+        ranked.extend(missing)
+        return [{"item_id": labels[label], "score": float(len(ranked)-i),
+                 "rationale": reasoning if i == 0 else ""} for i, label in enumerate(ranked)]

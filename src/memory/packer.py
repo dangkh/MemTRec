@@ -57,7 +57,7 @@ class SnippetPacker:
             if dataset.item_metadata and neighbor_id in dataset.item_metadata:
                 meta = dataset.item_metadata[neighbor_id]
                 title = meta.get('title', f'Item-{neighbor_id}')
-                desc = meta.get('description', '')
+                desc = str(meta.get('category', ''))
                 
                 # Truncate
                 title = title[:80] if len(title) > 80 else title
@@ -166,7 +166,7 @@ class SnippetPacker:
                 if dataset.item_metadata and cand_id in dataset.item_metadata:
                     meta = dataset.item_metadata[cand_id]
                     title = meta.get('title', f'Item-{cand_id}')
-                    cand_items.append(f"[{cand_id}] {title[:60]}")
+                    cand_items.append(f"[{cand_id}] {title[:60]} | {meta.get('category', '')}")
                 else:
                     cand_items.append(f"[{cand_id}]")
             candidates_text = "**Candidates to Rank:**\n" + "\n".join(

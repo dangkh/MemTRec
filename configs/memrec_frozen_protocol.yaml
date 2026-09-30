@@ -1,0 +1,42 @@
+data_format: frozen_json
+seed: 42
+num_train_users: 300
+num_test_users: 300
+history_size: 10
+# Set true only when deliberately using overlapping frozen train/eval lists.
+allow_overlap: false
+# Paths default to data/<dataset>/items.json, user_sequences.json,
+# user_negatives.json, train_users_300.json, eval_users_300.json,
+# user_candidates_testpool1000_seed42.json.
+n_eval_candidates: 20
+topk: [1, 3, 5, 10]
+metrics: [Hit, NDCG]
+item_text_mode: category
+instruction_mode: history
+eval_feedback: none
+debug: false
+save_llm_conversations: true
+provider:
+  name: local_hf
+  model: Qwen/Qwen2.5-7B-Instruct
+warmup:
+  enabled: true
+  rounds: 1
+  n_candidates: 20
+memrec:
+  k: 16
+  tau_tokens: 1800
+  n_facets: 3
+  temperature: 0.0
+  max_tokens: 1024
+  mix_min_users: 4
+  mix_min_items: 6
+  enable_stage_r: true
+  enable_stage_w: true  # TRAIN only; always blocked during eval.
+  reranker_mode: llm
+  reranker_output: list  # C-label, not raw/internal IDs.
+  stage_r_candidates: all
+  pruner:
+    mode: hybrid_rule
+  write:
+    fanout_cap: 8

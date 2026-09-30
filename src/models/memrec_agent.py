@@ -71,6 +71,7 @@ class MemRecAgent:
             pruner_checkpoint: Pruner MLP checkpoint path (for learned_mlp)
             debug: Whether to print debug information
         """
+        self.evaluation_only = False
         self.dataset = dataset
         self.llm_client = llm_client
         self.k = k
@@ -298,6 +299,8 @@ class MemRecAgent:
                 'stats': {...}
             }
         """
+        if self.evaluation_only or self.storage.read_only:
+            raise RuntimeError("Stage-W is forbidden during evaluation")
         # Prepare current user memory
         current_profile = self.storage.get_user_memory(user_id)
         user_mem_keys = [current_profile] if current_profile else []
@@ -439,7 +442,7 @@ class MemRecAgent:
         
         # Update item memory
         clicked_item_id = feedback.get('item_id')
-        if new_item_mem and clicked_item_id:
+        if new_item_mem and clicked_item_id is not None:
             self.storage.update_item_memory(clicked_item_id, new_item_mem)
             item_updated = 1
         else:
@@ -521,7 +524,8 @@ class MemRecAgent:
             candidate_list.append({
                 'id': cid,
                 'title': item_meta.get('title', 'N/A'),
-                'tags': item_meta.get('tags', [])
+                'tags': item_meta.get('tags', []),
+                'category': item_meta.get('category', '')
             })
         return candidate_list
     
