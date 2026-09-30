@@ -68,8 +68,18 @@ class FrozenRecDataset:
         ne = int(config.get('num_test_users', 300))
         train = user_list(path('train_users_file', f'train_users_{nt}.json'))
         evaluate = user_list(path('eval_users_file', f'eval_users_{ne}.json'))
-        if len(train) != nt or len(evaluate) != ne:
-            raise ValueError('Frozen user counts do not match num_train_users/num_test_users')
+        if nt <= 0 or ne <= 0:
+            raise ValueError('num_train_users and num_test_users must be positive')
+
+        if len(train) < nt or len(evaluate) < ne:
+            raise ValueError(
+                f'Not enough users: train={len(train)} (need {nt}), '
+                f'eval={len(evaluate)} (need {ne})'
+            )
+
+        # Lấy N user đầu tiên, giữ nguyên thứ tự trong file.
+        train = train[:nt]
+        evaluate = evaluate[:ne]
         overlap = set(train) & set(evaluate)
         if overlap and not config.get('allow_overlap', False):
             raise ValueError(f'Train/eval overlap: {len(overlap)} users; set allow_overlap explicitly')
