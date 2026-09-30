@@ -101,8 +101,6 @@ class FrozenRecDataset:
         def map_items(values):
             result = []
             for raw in ids(values):
-                if raw not in metadata or not isinstance(metadata[raw], dict):
-                    raise ValueError(f'Item {raw!r} missing metadata')
                 if raw not in self.item_id_map:
                     self.item_id_map[raw] = len(self.item_id_map)
                 result.append(self.item_id_map[raw])
@@ -147,9 +145,21 @@ class FrozenRecDataset:
             self.frozen_candidates[u] = candidates
         self.raw_item_ids = {v: k for k, v in self.item_id_map.items()}
         # Explicit allowlist: descriptions/reviews never enter downstream state.
-        self.item_metadata = {i: {'title': text(metadata[raw].get('title', '')),
-                                 'category': text(metadata[raw].get('category', metadata[raw].get('categories', '')))}
-                              for raw, i in self.item_id_map.items()}
+        self.item_metadata = {}
+        self.missing_metadata_ids = []
+        for raw, internal_id in self.item_id_map.items():
+            meta = metadata.get(raw)
+            if not isinstance(meta, dict):
+                meta = {}
+                self.missing_metadata_ids.append(raw)
+            self.item_metadata[internal_id] = {
+                'title': text(meta.get('title')).strip() or 'Unknown item',
+                'category': text(meta.get('category') or meta.get('categories')).strip() or 'Unknown',
+            }
+        if self.missing_metadata_ids:
+            print(f'[WARN] Missing metadata for {len(self.missing_metadata_ids)} items; '
+                  f'examples={self.missing_metadata_ids[:10]}. '
+                  'IDs and candidate order are preserved.')
         self.n_users, self.n_items = len(self.user_id_map), len(self.item_id_map)
         self.instructions = self.reviews = self.ranked_lists = None
         self.n_interactions = sum(map(len, self.full_train_data.values())) + len(self.valid_data) + len(self.test_data)
