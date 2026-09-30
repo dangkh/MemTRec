@@ -1389,6 +1389,8 @@ class MemRecTrainer:
                     'candidate_item_ids': [ds.raw_item_ids[i] for i in candidates],
                     'ranked_item_ids': [ds.raw_item_ids[i] for i in ranked],
                     'target': ds.raw_item_ids[target],
+                    'stage_r_error': details.get('retrieval_bundle', {}).get('_error'),
+                    'stage_r_diagnostics': details.get('retrieval_bundle', {}).get('_diagnostics', {}),
                     'diagnostics': getattr(self.agent.reranker, 'last_diagnostics', {})},
                     ensure_ascii=False)+'\n')
                 output.flush()

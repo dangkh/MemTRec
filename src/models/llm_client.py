@@ -175,11 +175,19 @@ class LLMClient:
         gen_ids = outputs[0][input_len:]
         response = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
+        eos_ids = getattr(self.hf_model.generation_config, 'eos_token_id', None)
+        eos_ids = eos_ids if isinstance(eos_ids, list) else [eos_ids]
+        ended_eos = bool(len(gen_ids) and int(gen_ids[-1]) in eos_ids)
+        self.last_generation_metadata = {
+            'input_tokens': int(input_len), 'input_truncated': False,
+            'output_tokens': int(len(gen_ids)), 'max_new_tokens': int(max_tokens),
+            'ended_eos': ended_eos,
+            'output_hit_limit': bool(len(gen_ids) >= max_tokens and not ended_eos)}
         self.total_input_tokens += input_len
         self.total_output_tokens += len(gen_ids)
         self.total_requests += 1
 
-        self._log_conversation(messages=messages, response=response, metadata={'temperature': temperature, 'max_tokens': max_tokens})
+        self._log_conversation(messages=messages, response=response, metadata={'temperature': temperature, **self.last_generation_metadata})
         return response
 
     def generate(
@@ -312,6 +320,42 @@ class LLMClient:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         return match.group(0) if match else text
 
+    @staticmethod
+    def _parse_json_response(text):
+        """Repair string escaping only; never invent missing structural JSON."""
+        payload = LLMClient._extract_json(text)
+        try:
+            result = json.loads(payload)
+            if not isinstance(result, dict):
+                raise ValueError("Expected a JSON object")
+            return result, False
+        except json.JSONDecodeError:
+            pass
+        out, inside, i = [], False, 0
+        while i < len(payload):
+            ch = payload[i]
+            if ch == '"':
+                inside = not inside
+            if inside and ch == "\\" and i+1 < len(payload):
+                nxt = payload[i+1]
+                if nxt == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                if nxt not in '"\\/bfnrtu':
+                    out.append("\\\\")
+                    i += 1
+                    continue
+                out.extend([ch, nxt])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        result = json.loads(''.join(out), strict=False)
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+        return result, True
+
     def generate_json(
         self,
         messages: List[Dict[str, str]],
@@ -361,31 +405,37 @@ class LLMClient:
             }
         }
         
-        response_text = self.generate(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            json_schema=json_schema
-        )
-        
-        try:
-            response_dict = json.loads(self._extract_json(response_text))
+        # At most one retry for malformed JSON. Incomplete ranking lists are handled
+        # by the ranker, not regenerated here, preserving the declared repair policy.
+        active_messages = list(messages)
+        attempts = []
+        for attempt in range(2):
+            response_text = self.generate(messages=active_messages, temperature=temperature,
+                                          max_tokens=max_tokens, json_schema=json_schema)
+            record = {"attempt": attempt+1, "raw_response": response_text,
+                      "generation": dict(getattr(self, 'last_generation_metadata', {}))}
+            try:
+                result, repaired = self._parse_json_response(response_text)
+                record.update(parse_ok=True, escape_repaired=repaired)
+                attempts.append(record)
+                self.last_json_diagnostics = {"attempts": attempts}
+                if debug_logger:
+                    debug_logger(json.dumps(self.last_json_diagnostics, ensure_ascii=False))
+                return result
+            except (ValueError, TypeError) as exc:
+                record.update(parse_ok=False, error=str(exc))
+                attempts.append(record)
+                self.last_json_diagnostics = {"attempts": attempts}
+                if attempt == 1:
+                    if debug_logger:
+                        debug_logger(json.dumps(self.last_json_diagnostics, ensure_ascii=False))
+                    raise ValueError(f"Malformed JSON after 2 attempts: {exc}") from exc
+                active_messages = list(messages) + [{"role": "user", "content":
+                    "Regenerate the complete answer as concise valid JSON. The previous answer "
+                    "was malformed or incomplete. Use double-quoted strings and numeric values, "
+                    "no comments or ellipses. Apostrophes need no escaping. Finish all arrays "
+                    "and objects. Follow the original requested counts and fields."}]
 
-            # Debug log: record LLM output
-            if debug_logger:
-                debug_logger("\n>>> LLM OUTPUT (Parsed JSON) <<<")
-                debug_logger(json.dumps(response_dict, indent=2, ensure_ascii=False))
-                debug_logger("")  # Empty line separator
-            
-            return response_dict
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON: {e}")
-            print(f"Raw response: {response_text}")
-            if debug_logger:
-                debug_logger(f"\n❌ JSON Parse Error: {e}")
-                debug_logger(f"Raw response:\n{response_text}")
-            raise
-    
     def get_token_stats(self) -> Dict[str, int]:
         """Get cumulative token usage statistics"""
         return {

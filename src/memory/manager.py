@@ -89,6 +89,13 @@ Your response should be a JSON object with two fields:
   * "w": The edge weight between 0 and 1 (number)
 """
         
+        prompt += (
+            f"\nKeep the response compact: at most {n_facets} facets, each at most 18 words; "
+            "at most 2 supporting neighbors per facet and at most 6 support_edges total. "
+            "Use only neighbor IDs present in the supplied context. Empty arrays are valid "
+            "when evidence is absent. Return JSON only, no extra explanations or repeated "
+            "metadata. Apostrophes inside strings do not need escaping.\n"
+        )
         # Single message format (more natural)
         messages = [
             {"role": "user", "content": prompt}
@@ -174,13 +181,16 @@ Your response should be a JSON object with two fields:
                 max_tokens=max_tokens,
                 debug_logger=debug_logger
             )
+            response['_diagnostics'] = getattr(self.llm, 'last_json_diagnostics', {})
             return response
         except Exception as e:
             print(f"Error in Stage-R for user {user_id}: {e}")
             # Return empty response
             return {
                 "facets": [],
-                "support_edges": []
+                "support_edges": [],
+                "_error": str(e),
+                "_diagnostics": getattr(self.llm, "last_json_diagnostics", {})
             }
     
     # ========================================================================

@@ -316,8 +316,13 @@ Your response should be a JSON object with a single field:
             "\nRetrieved preferences:\n" + json.dumps(
                 [] if vanilla_mode else retrieval_bundle.get("facets", []), ensure_ascii=False) +
             "\nCandidates:\n" + json.dumps(rows, ensure_ascii=False) +
-            '\nReturn only JSON: {"ranking": ["C01", "C02"], "reasoning": "One sentence."}'
-            " The example labels are illustrative; return every supplied candidate label."
+            f"\nReturn exactly {len(labels)} distinct labels in ranking. "
+            "Reorder the full label set below by relevance; do not copy its input order. "
+            "Do not return only the top two.\nAllowed label set: " + json.dumps(list(labels)) +
+            '\nReturn one JSON object with fields "ranking" (the full ordered label array) '
+            'and "reasoning" (one short sentence, at most 25 words). '
+            "Use valid JSON escapes; apostrophes do not need escaping."
+
         )
         error = None
         try:
@@ -343,7 +348,10 @@ Your response should be a JSON object with a single field:
                 ranked.append(label)
         missing = [label for label in labels if label not in seen]
         self.last_diagnostics = {"raw_labels": raw, "missing": missing, "unknown": unknown,
-                                 "duplicates": duplicate, "error": error, "reasoning": reasoning}
+                                 "duplicates": duplicate, "error": error, "reasoning": reasoning,
+                                 "returned_count": len(raw), "expected_count": len(labels),
+                                 "repair_used": bool(missing or unknown or duplicate or error),
+                                 "json_diagnostics": getattr(self.llm, 'last_json_diagnostics', {})}
         ranked.extend(missing)
         return [{"item_id": labels[label], "score": float(len(ranked)-i),
                  "rationale": reasoning if i == 0 else ""} for i, label in enumerate(ranked)]
