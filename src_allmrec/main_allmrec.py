@@ -42,7 +42,7 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stage1_lr", type=float, default=1e-4)
 
     # Qwen Stage 2 / evaluation.
-    p.add_argument("--model_name", default="unsloth/Qwen2.5-7B-Instruct-bnb-4bit")
+    p.add_argument("--model_name", default="unsloth/Qwen2.5-7B-Instruct-unsloth-bnb-4bit")
     p.add_argument("--llm_backend", choices=["unsloth", "transformers"], default="unsloth")
     p.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max_seq_length", type=int, default=8192)
