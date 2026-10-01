@@ -10,9 +10,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .data import ProtocolData
-from .gemma_bridge import GemmaBridge
+from .qwen_bridge import QwenBridge, BRIDGE_VERSION
 from .metrics import compute_metrics
-from .model import ALLMRecGemma, sample_stage2_candidates
+from .model import ALLMRecQwen, sample_stage2_candidates
 from .sasrec import SASRec, SASRecTrainDataset, sasrec_bce_loss
 from .stage1 import LastTransitionDataset, Stage1Alignment, TwoLayerAligner, collate_last_transition
 from .utils import dump_json, dump_jsonl, ensure_dir, set_seed
@@ -63,7 +63,7 @@ def train_sasrec(data: ProtocolData, args) -> Path:
 
 
 def load_sasrec(data: ProtocolData, args) -> SASRec:
-    ckpt = torch.load(Path(args.output_dir) / "sasrec.pt", map_location="cpu")
+    ckpt = torch.load(Path(getattr(args, "pretrained_dir", None) or args.output_dir) / "sasrec.pt", map_location="cpu")
     if ckpt.get("fingerprint") != data.fingerprint:
         raise ValueError("SASRec checkpoint protocol fingerprint mismatch")
     model = SASRec(
@@ -176,7 +176,7 @@ def train_stage1(data: ProtocolData, args) -> Path:
 
 
 def load_item_aligner(data: ProtocolData, args, sasrec: SASRec) -> TwoLayerAligner:
-    ckpt = torch.load(Path(args.output_dir) / "stage1.pt", map_location="cpu")
+    ckpt = torch.load(Path(getattr(args, "pretrained_dir", None) or args.output_dir) / "stage1.pt", map_location="cpu")
     if ckpt.get("fingerprint") != data.fingerprint:
         raise ValueError("Stage1 checkpoint protocol fingerprint mismatch")
     m = TwoLayerAligner(sasrec.hidden_size, ckpt["alignment_dim"], "sigmoid")
@@ -185,19 +185,19 @@ def load_item_aligner(data: ProtocolData, args, sasrec: SASRec) -> TwoLayerAlign
     return m
 
 
-def _build_stage2_model(data: ProtocolData, args) -> ALLMRecGemma:
+def _build_stage2_model(data: ProtocolData, args) -> ALLMRecQwen:
     sasrec = load_sasrec(data, args)
     item_aligner = load_item_aligner(data, args, sasrec)
-    bridge = GemmaBridge(
+    bridge = QwenBridge(
         args.model_name,
         args.device,
         max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
         backend=args.llm_backend,
     )
-    # Do not call `.to()` on the full wrapper: a bitsandbytes 4-bit Gemma
+    # Do not call `.to()` on the full wrapper: a bitsandbytes 4-bit Qwen
     # is already placed by Unsloth/Transformers and may reject a later `.to()`.
-    model = ALLMRecGemma(sasrec, item_aligner, bridge, data, args.max_item_text_chars)
+    model = ALLMRecQwen(sasrec, item_aligner, bridge, data, args.max_item_text_chars)
     model.user_proj.to(args.device)
     model.item_proj.to(args.device)
     return model
@@ -207,6 +207,7 @@ def train_stage2(data: ProtocolData, args) -> Path:
     set_seed(args.seed)
     out = ensure_dir(args.output_dir)
     model = _build_stage2_model(data, args)
+    model.bridge.set_training_mode()
     trainable = list(model.user_proj.parameters()) + list(model.item_proj.parameters())
     opt = torch.optim.Adam(trainable, lr=args.stage2_lr, betas=(0.9, 0.98))
     ds = LastTransitionDataset([u.train for u in data.users], data.num_items, args.seed)
@@ -228,7 +229,13 @@ def train_stage2(data: ProtocolData, args) -> Path:
                 )
             opt.zero_grad(set_to_none=True)
             loss = model.stage2_loss(history, target, candidate_lists)
+            if not loss.requires_grad or not torch.isfinite(loss):
+                raise RuntimeError("Stage2 loss has no gradient or is not finite")
             loss.backward()
+            for name, projection in (("user", model.user_proj), ("item", model.item_proj)):
+                grads = [p.grad for p in projection.parameters() if p.grad is not None]
+                if not grads or not all(torch.isfinite(g).all() for g in grads) or not any(torch.count_nonzero(g) for g in grads):
+                    raise RuntimeError(f"Stage2 {name} projection gradients missing/zero/non-finite; check Unsloth version")
             torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
             opt.step()
             losses.append(float(loss.detach().cpu()))
@@ -240,6 +247,7 @@ def train_stage2(data: ProtocolData, args) -> Path:
         {
             "fingerprint": data.fingerprint,
             "model_name": args.model_name,
+            "bridge_version": BRIDGE_VERSION,
             "user_proj": model.user_proj.state_dict(),
             "item_proj": model.item_proj.state_dict(),
             "hidden_size": model.bridge.hidden_size,
@@ -249,16 +257,19 @@ def train_stage2(data: ProtocolData, args) -> Path:
     return path
 
 
-def load_stage2_model(data: ProtocolData, args) -> ALLMRecGemma:
-    model = _build_stage2_model(data, args)
+def load_stage2_model(data: ProtocolData, args) -> ALLMRecQwen:
     ckpt = torch.load(Path(args.output_dir) / "stage2.pt", map_location="cpu")
     if ckpt.get("fingerprint") != data.fingerprint:
         raise ValueError("Stage2 checkpoint protocol fingerprint mismatch")
     if ckpt.get("model_name") != args.model_name:
         raise ValueError(f"Stage2 checkpoint model={ckpt.get('model_name')} but CLI model={args.model_name}")
+    if ckpt.get("bridge_version") != BRIDGE_VERSION:
+        raise ValueError("Retrain Stage2 with this Qwen chat bridge; old projections are incompatible")
+    model = _build_stage2_model(data, args)
     model.user_proj.load_state_dict(ckpt["user_proj"])
     model.item_proj.load_state_dict(ckpt["item_proj"])
     model.eval()
+    model.bridge.set_inference_mode()
     return model
 
 
@@ -269,6 +280,7 @@ def evaluate(data: ProtocolData, args) -> dict[str, float]:
     parse_failures = 0
     parse_reasons: dict[str, int] = {}
     identity_rankings = 0
+    repaired_rankings = 0
 
     eval_batch_size = max(1, int(args.eval_batch_size))
     max_new_tokens = int(args.eval_max_new_tokens)
@@ -290,16 +302,18 @@ def evaluate(data: ProtocolData, args) -> dict[str, float]:
 
         for u, result in zip(batch_users, batch_results):
             ranked, raw_output, parse_ok, parse_reason, parsed_order = result
+            repaired_rankings += int(parse_reason == "repaired")
 
             if not parse_ok:
                 parse_failures += 1
                 parse_reasons[parse_reason] = (
                     parse_reasons.get(parse_reason, 0) + 1
                 )
-                print(
-                    f"[WARN] ranking parse failed for user={u.user_id}; "
-                    f"reason={parse_reason}; falling back to candidate order"
-                )
+                if args.eval_debug_outputs:
+                    print(
+                        f"[WARN] ranking parse failed for user={u.user_id}; "
+                        f"reason={parse_reason}; falling back to candidate order"
+                    )
             elif parsed_order == list(range(1, len(u.candidates) + 1)):
                 identity_rankings += 1
 
@@ -336,6 +350,8 @@ def evaluate(data: ProtocolData, args) -> dict[str, float]:
         len(data.users) - parse_failures
     ) / n_users
     metrics["ParseFailures"] = parse_failures
+    metrics["RepairedRankings"] = repaired_rankings
+    metrics["CompleteRankingRate"] = (len(data.users) - parse_failures - repaired_rankings) / n_users
     metrics["IdentityRankingRate"] = identity_rankings / n_users
     metrics["IdentityRankings"] = identity_rankings
     metrics["EvalBatchSize"] = eval_batch_size
@@ -357,7 +373,7 @@ def evaluate(data: ProtocolData, args) -> dict[str, float]:
 
 @torch.no_grad()
 def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
-    """Text-only frozen-Gemma sanity check.
+    """Text-only frozen-Qwen sanity check.
 
     This path intentionally does NOT load or use:
       - sasrec.pt,
@@ -368,7 +384,7 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
       - Stage-2 learned projections.
 
     It uses only:
-      - the same frozen Gemma backbone,
+      - the same frozen Qwen backbone,
       - the same observed TRAIN-history titles,
       - the same frozen candidate titles and candidate order,
       - the same C-label output grammar and ranking parser.
@@ -378,11 +394,11 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
     set_seed(args.seed)
 
     print(
-        "[Native sanity check] Frozen Gemma + history titles + candidate titles. "
+        "[Native sanity check] Frozen Qwen + history titles + candidate titles. "
         "No SASRec/Stage1/Stage2 checkpoint is loaded."
     )
 
-    bridge = GemmaBridge(
+    bridge = QwenBridge(
         args.model_name,
         args.device,
         max_seq_length=args.max_seq_length,
@@ -395,6 +411,7 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
     parse_failures = 0
     parse_reasons: dict[str, int] = {}
     identity_rankings = 0
+    repaired_rankings = 0
 
     eval_batch_size = max(1, int(args.eval_batch_size))
     max_new_tokens = int(args.eval_max_new_tokens)
@@ -443,6 +460,7 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
 
         for u, gen in zip(batch_users, generations):
             parsed_order = list(gen.order_1based)
+            repaired_rankings += int(gen.parse_reason == "repaired")
 
             if gen.parse_ok:
                 ranked = [
@@ -457,10 +475,11 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
                 parse_reasons[gen.parse_reason] = (
                     parse_reasons.get(gen.parse_reason, 0) + 1
                 )
-                print(
-                    f"[WARN] native ranking parse failed for user={u.user_id}; "
-                    f"reason={gen.parse_reason}; falling back to candidate order"
-                )
+                if args.eval_debug_outputs:
+                    print(
+                        f"[WARN] native ranking parse failed for user={u.user_id}; "
+                        f"reason={gen.parse_reason}; falling back to candidate order"
+                    )
 
             if gen.parse_ok and parsed_order == list(
                 range(1, len(u.candidates) + 1)
@@ -510,6 +529,8 @@ def evaluate_native(data: ProtocolData, args) -> dict[str, float]:
         len(data.users) - parse_failures
     ) / n_users
     metrics["ParseFailures"] = parse_failures
+    metrics["RepairedRankings"] = repaired_rankings
+    metrics["CompleteRankingRate"] = (len(data.users) - parse_failures - repaired_rankings) / n_users
     metrics["IdentityRankingRate"] = identity_rankings / n_users
     metrics["IdentityRankings"] = identity_rankings
     metrics["EvalBatchSize"] = eval_batch_size

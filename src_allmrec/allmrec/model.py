@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from .data import ProtocolData
-from .gemma_bridge import GemmaBridge
+from .qwen_bridge import QwenBridge
 from .sasrec import SASRec
 from .stage1 import TwoLayerAligner
 
@@ -29,12 +29,12 @@ class Projection(nn.Module):
         return self.net(x)
 
 
-class ALLMRecGemma(nn.Module):
+class ALLMRecQwen(nn.Module):
     def __init__(
         self,
         sasrec: SASRec,
         item_aligner: TwoLayerAligner,
-        bridge: GemmaBridge,
+        bridge: QwenBridge,
         data: ProtocolData,
         max_item_text_chars: int = 160,
     ):
@@ -192,7 +192,7 @@ class ALLMRecGemma(nn.Module):
         outputs = []
         for candidates, gen in zip(normalized_candidates, generations):
             if gen.parse_ok:
-                # Keep valid Gemma ranking exactly as generated.
+                # Keep valid Qwen ranking exactly as generated.
                 ranked = [candidates[i - 1] for i in gen.order_1based]
             else:
                 # Same conservative policy as CoMemTree: only parse failure

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from allmrec.data import load_protocol, save_protocol_snapshot
-from allmrec.train import evaluate, evaluate_native, train_sasrec, train_stage1, train_stage2
-from allmrec.utils import ensure_dir
 
 
 def add_common(p: argparse.ArgumentParser) -> None:
@@ -18,6 +15,7 @@ def add_common(p: argparse.ArgumentParser) -> None:
         help="Frozen candidate file from CoMemTree; candidate order is used exactly as stored.",
     )
     p.add_argument("--output_dir", required=True)
+    p.add_argument("--pretrained_dir", default=None, help="Existing sasrec.pt and stage1.pt directory; defaults to output_dir.")
     p.add_argument("--num_users", type=int, default=300)
     p.add_argument("--history_size", type=int, default=10)
     p.add_argument("--num_negatives", type=int, default=19)
@@ -43,8 +41,8 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stage1_batch_size", type=int, default=32)
     p.add_argument("--stage1_lr", type=float, default=1e-4)
 
-    # Gemma Stage 2 / evaluation.
-    p.add_argument("--model_name", default="unsloth/gemma-3-4b-it-unsloth-bnb-4bit")
+    # Qwen Stage 2 / evaluation.
+    p.add_argument("--model_name", default="unsloth/Qwen2.5-7B-Instruct-bnb-4bit")
     p.add_argument("--llm_backend", choices=["unsloth", "transformers"], default="unsloth")
     p.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max_seq_length", type=int, default=8192)
@@ -58,7 +56,7 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "--eval_batch_size",
         type=int,
         default=4,
-        help="Number of users per Gemma generate() call during evaluation.",
+        help="Number of users per Qwen generate() call during evaluation.",
     )
     p.add_argument(
         "--eval_max_new_tokens",
@@ -70,13 +68,13 @@ def add_common(p: argparse.ArgumentParser) -> None:
         "--eval_debug_outputs",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Print raw Gemma output and parse result for every evaluated user.",
+        help="Print raw Qwen output and parse result for every evaluated user.",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="A-LLMRec adapted to CoMemTree: Gemma-3-4B, same 300 users, up to the last 10 train interactions/user, frozen 20 candidates."
+        description="A-LLMRec adapted to CoMemTree: Qwen2.5-7B, configurable user count, up to the last 10 train interactions/user, frozen 20 candidates."
     )
     sub = parser.add_subparsers(dest="command", required=True)
     for cmd in ("validate", "train-sasrec", "train-stage1", "train-stage2", "evaluate", "evaluate-native", "all"):
@@ -88,6 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
 def load_data(args):
     if args.candidate_size != args.num_negatives + 1:
         raise ValueError("candidate_size must equal num_negatives + 1")
+    from allmrec.data import load_protocol, save_protocol_snapshot
+    from allmrec.utils import ensure_dir
     data = load_protocol(
         dataset=args.dataset,
         items_path=args.items,
@@ -122,6 +122,9 @@ def load_data(args):
 
 def main():
     args = build_parser().parse_args()
+    if args.llm_backend == "unsloth" and args.command in {"train-stage2", "evaluate", "evaluate-native", "all"}:
+        import unsloth  # Must precede torch/transformers imports.
+    from allmrec.train import evaluate, evaluate_native, train_sasrec, train_stage1, train_stage2
     data = load_data(args)
     if args.command == "validate":
         print("Protocol validation OK. No model training performed.")
