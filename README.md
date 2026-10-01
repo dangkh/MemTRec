@@ -144,3 +144,20 @@ python infer_tree_gemma_precom.py \
 
 inference_tree_latest_behavior_gemma_clabel for labeling candidate as Cxx: c01-c20
 inference_tree_latest_behavior_gemma_video_game for video game prompt.
+
+memrec:
+```bash
+python scripts/run_train.py \
+  --dataset Video_Games \
+  --data_dir data/Video_Games \
+  --config configs/memrec_frozen_protocol.yaml \
+  --train_users_file data/Video_Games/train_users_1000.json \
+  --eval_users_file data/Video_Games/eval_users_1000.json \
+  --candidate_file data/Video_Games/user_candidates_testpool1000_seed42.json \
+  --num_train_users 1000 \
+  --num_test_users 1000 \
+  --history_size 10 \
+  --n_eval_candidates 20 \
+  --allow_overlap \
+  --output_dir results/memrec_qwen_vd_1000_clabel
+```
