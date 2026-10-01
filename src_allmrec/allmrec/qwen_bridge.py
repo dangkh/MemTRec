@@ -106,10 +106,24 @@ class QwenBridge(nn.Module):
     def set_training_mode(self):
         if self.backend == 'unsloth':
             from unsloth import FastLanguageModel
-            FastLanguageModel.for_training(self.model, use_gradient_checkpointing=True)
+            FastLanguageModel.for_training(self.model, use_gradient_checkpointing=False)
         else:
             self.model.train()
-            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        # for_training alone can set decoder flags without installing the
+        # Transformers checkpoint callable. Initialize it through the public API
+        # AFTER switching Unsloth back to training mode. Non-reentrant checkpoint
+        # preserves autograd for our external projection inputs with frozen weights.
+        self.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={'use_reentrant': False}
+        )
+        for module in self.model.modules():
+            if getattr(module, 'gradient_checkpointing', False) and not callable(
+                getattr(module, '_gradient_checkpointing_func', None)
+            ):
+                raise RuntimeError(
+                    f'{type(module).__name__}: checkpointing initialization failed; '
+                    'gradient_checkpointing_enable did not install its callable'
+                )
         for p in self.model.parameters():
             p.requires_grad_(False)
         self.model.config.use_cache = False
